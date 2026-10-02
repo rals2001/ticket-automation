@@ -25,15 +25,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # NOTE: The local "Input CSV" folder is no longer used.
 # CSV files are now uploaded by the user via the Streamlit web interface.
-SHAPEFILE = BASE_DIR / "Shapefile" / "gadm41_IDN_3.shp"
 
-# Companion files that must exist next to the .shp
-SHAPEFILE_REQUIRED_FILES = [
-    BASE_DIR / "Shapefile" / "gadm41_IDN_3.shp",
-    BASE_DIR / "Shapefile" / "gadm41_IDN_3.shx",
-    BASE_DIR / "Shapefile" / "gadm41_IDN_3.dbf",
-    BASE_DIR / "Shapefile" / "gadm41_IDN_3.prj",
-]
+# Shapefile base name and the companion files that must exist next to the .shp
+SHAPEFILE_NAME = "gadm41_IDN_3"
+SHAPEFILE_EXTS = [".shp", ".shx", ".dbf", ".prj"]
 
 # Indonesian month names
 bulan_id = {
@@ -186,13 +181,56 @@ def parse_waktu_value(raw_value):
 # CHECK REQUIRED SHAPEFILE
 # =========================
 def check_shapefile():
-    missing_files = [p.name for p in SHAPEFILE_REQUIRED_FILES if not p.is_file()]
-    if missing_files:
+    """
+    Locates the shapefile anywhere inside the repository (case-insensitive)
+    and verifies that all companion files exist next to it.
+    Returns the Path to the .shp file.
+    """
+    search_roots = [BASE_DIR]
+    if Path.cwd().resolve() != BASE_DIR:
+        search_roots.append(Path.cwd().resolve())
+
+    shp_path = None
+    for root in search_roots:
+        for p in root.rglob("*"):
+            if ".git" in p.parts:
+                continue
+            if p.is_file() and p.name.lower() == f"{SHAPEFILE_NAME}.shp".lower():
+                shp_path = p
+                break
+        if shp_path:
+            break
+
+    if shp_path is None:
+        # Build a small diagnostic so the real repo layout is visible
+        listing = []
+        for root in search_roots:
+            for p in sorted(root.rglob("*")):
+                if ".git" in p.parts or "__pycache__" in p.parts:
+                    continue
+                listing.append(str(p.relative_to(root)))
+                if len(listing) >= 60:
+                    break
         raise MissingShapefileError(
-            "Shapefile component(s) not found in the 'Shapefile' folder of the repository: "
-            + ", ".join(missing_files)
-            + ".\nPlace gadm41_IDN_3.shp (plus .shx, .dbf, .prj) in a folder named 'Shapefile' next to app.py."
+            f"Could not find '{SHAPEFILE_NAME}.shp' anywhere in the repository.\n"
+            f"App location: {BASE_DIR}\n"
+            f"Files visible to the app:\n" + "\n".join(listing)
         )
+
+    # Verify companion files in the same folder (case-insensitive)
+    names_in_dir = {p.name.lower() for p in shp_path.parent.iterdir()}
+    missing = [
+        f"{SHAPEFILE_NAME}{ext}"
+        for ext in SHAPEFILE_EXTS
+        if f"{SHAPEFILE_NAME}{ext}".lower() not in names_in_dir
+    ]
+    if missing:
+        raise MissingShapefileError(
+            f"Found {shp_path.name} in '{shp_path.parent}', but these companion "
+            f"files are missing: {', '.join(missing)}"
+        )
+
+    return shp_path
 
 
 @st.cache_resource(show_spinner=False)
@@ -213,7 +251,7 @@ def process_uploaded_files(uploaded_files):
     # =========================
     # CHECK REQUIRED FILES
     # =========================
-    check_shapefile()
+    shp_path = check_shapefile()
 
     # =========================
     # FIND CSV FILES (uploaded via Streamlit)
@@ -342,7 +380,7 @@ def process_uploaded_files(uploaded_files):
     # =========================
     # READ SHAPEFILE
     # =========================
-    gdf_admin = load_admin_shapefile(str(SHAPEFILE))
+    gdf_admin = load_admin_shapefile(str(shp_path))
 
     if gdf_admin.crs != gdf_points.crs:
         gdf_admin = gdf_admin.to_crs(gdf_points.crs)
@@ -503,7 +541,8 @@ if process_clicked:
             st.session_state["stats"] = stats
 
         except MissingShapefileError as e:
-            st.error(f"Missing shapefile: {e}")
+            st.error("Missing shapefile")
+            st.code(str(e))
         except InvalidCSVError as e:
             st.error(f"Invalid CSV: {e}")
         except ValueError as e:
