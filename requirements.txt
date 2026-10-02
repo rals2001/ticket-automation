@@ -2,3 +2,4 @@ streamlit
 pandas
 duckdb
 openpyxl
+geopandas
