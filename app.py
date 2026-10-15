@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover
 # =========================
 # PAGE CONFIG
 # =========================
-st.set_page_config(page_title="Ticket Automation", page_icon="🎫", layout="centered")
+st.set_page_config(page_title="Ticket Indihome - Compile Tickets and Define Locations", page_icon="🎫", layout="centered")
 
 # =========================
 # FILE PATHS (relative to this file's location)
