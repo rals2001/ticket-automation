@@ -513,7 +513,7 @@ def process_uploaded_files(uploaded_files):
 # =========================
 # STREAMLIT UI
 # =========================
-st.title("Ticket Automation")
+st.title("Ticket Indihome - Compile Tickets and Define Locations")
 
 uploaded_files = st.file_uploader(
     "Upload CSV files",
