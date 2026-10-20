@@ -1,5 +1,6 @@
 import io
 import re
+from copy import copy
 from datetime import datetime
 from pathlib import Path
 
@@ -24,7 +25,7 @@ st.set_page_config(page_title="Ticket Indihome - Compile Tickets and Define Loca
 BASE_DIR = Path(__file__).resolve().parent
 
 # NOTE: The local "Input CSV" folder is no longer used.
-# CSV files are now uploaded by the user via the Streamlit web interface.
+# CSV / XLSX files are now uploaded by the user via the Streamlit web interface.
 
 # Shapefile base name and the companion files that must exist next to the .shp
 SHAPEFILE_NAME = "gadm41_IDN_3"
@@ -65,6 +66,10 @@ CANDIDATE_FORMATS = [
 
 class InvalidCSVError(Exception):
     """Raised when an uploaded CSV file is invalid or malformed."""
+
+
+class InvalidExcelError(Exception):
+    """Raised when an uploaded Excel (.xlsx) file is invalid or malformed."""
 
 
 class MissingShapefileError(Exception):
@@ -239,9 +244,9 @@ def load_admin_shapefile(shp_path_str):
     return gpd.read_file(shp_path_str)
 
 
-# =========================
-# MAIN PROCESSING FUNCTION
-# =========================
+# =========================================================
+# CSV PIPELINE (UNCHANGED)
+# =========================================================
 def process_uploaded_files(uploaded_files):
     """
     Runs the full pipeline on the uploaded CSV files and returns
@@ -510,64 +515,436 @@ def process_uploaded_files(uploaded_files):
     return final_buffer.getvalue(), stats
 
 
+# =========================================================
+# XLSX PIPELINE (NEW)
+# =========================================================
+def read_xlsx_upload(uploaded_file):
+    """
+    Reads one uploaded .xlsx file (active sheet) with openpyxl.
+
+    Returns:
+        df              -> DataFrame WITHOUT column F (header = row 1)
+        waktu_col_name  -> header text of column F
+        waktu_items     -> list of dicts (value + original cell style) for column F,
+                           perfectly aligned with the rows of df
+    Fully blank rows are skipped in BOTH df and waktu_items so they never
+    drift out of alignment.
+    """
+    try:
+        wb = load_workbook(io.BytesIO(uploaded_file.getvalue()))
+    except Exception as e:
+        raise InvalidExcelError(
+            f"File '{uploaded_file.name}' could not be read as an .xlsx file: {e}"
+        )
+
+    ws = wb.active
+
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1), None)
+    if not header_cells:
+        raise InvalidExcelError(f"File '{uploaded_file.name}' appears to be empty.")
+
+    header = []
+    for i, c in enumerate(header_cells):
+        if c.value is None or str(c.value).strip() == "":
+            header.append(f"Unnamed: {i}")
+        else:
+            header.append(str(c.value).strip())
+
+    if len(header) < WAKTU_COL:
+        raise InvalidExcelError(
+            f"File '{uploaded_file.name}' has fewer than {WAKTU_COL} columns."
+        )
+
+    n_cols = len(header)
+    data = []
+    waktu_items = []
+
+    for row in ws.iter_rows(min_row=2, max_col=n_cols):
+        values = [c.value for c in row]
+
+        # skip fully blank rows (in both df and waktu list)
+        if all(v is None or (isinstance(v, str) and v.strip() == "") for v in values):
+            continue
+
+        # pad in case the row is shorter than the header
+        while len(values) < n_cols:
+            values.append(None)
+
+        cell = row[WAKTU_COL - 1] if len(row) >= WAKTU_COL else None
+
+        if cell is not None:
+            waktu_items.append({
+                "value": cell.value,
+                "font": copy(cell.font),
+                "fill": copy(cell.fill),
+                "border": copy(cell.border),
+                "alignment": copy(cell.alignment),
+                "protection": copy(cell.protection),
+                "number_format": cell.number_format,
+            })
+        else:
+            waktu_items.append({"value": None, "number_format": "General"})
+
+        data.append(values)
+
+    temp_df = pd.DataFrame(data, columns=header)
+
+    # Drop column F by POSITION (safe even if header names repeat)
+    keep_positions = [i for i in range(temp_df.shape[1]) if i != WAKTU_COL - 1]
+    temp_df = temp_df.iloc[:, keep_positions]
+
+    return temp_df, header[WAKTU_COL - 1], waktu_items
+
+
+def add_provinsi_kabupaten(df, shp_path):
+    """
+    Adds 'Provinsi' and 'Kabupaten/Kota' columns to df using Longitude/Latitude
+    and the GADM level-3 shapefile. Rows without valid coordinates stay blank.
+    """
+    gdf_points = gpd.GeoDataFrame(
+        df.copy(),
+        geometry=gpd.points_from_xy(df["Longitude"], df["Latitude"]),
+        crs="EPSG:4326",
+    )
+
+    gdf_admin = load_admin_shapefile(str(shp_path))
+    if gdf_admin.crs != gdf_points.crs:
+        gdf_admin = gdf_admin.to_crs(gdf_points.crs)
+
+    result = gpd.sjoin(gdf_points, gdf_admin, how="left", predicate="within")
+    # a point sitting exactly on a shared border can match >1 polygon
+    result = result[~result.index.duplicated(keep="first")]
+
+    # Fallback for boundary points (only rows that HAVE coordinates)
+    has_coords = df["Longitude"].notna() & df["Latitude"].notna()
+    missing = result["NAME_1"].isna() & has_coords.reindex(result.index, fill_value=False)
+
+    if missing.any():
+        fallback = gpd.sjoin_nearest(gdf_points[missing], gdf_admin, how="left")
+        fallback = fallback[~fallback.index.duplicated(keep="first")]
+        result.loc[fallback.index, ["NAME_1", "NAME_2"]] = fallback[["NAME_1", "NAME_2"]].values
+
+    df["Provinsi"] = result["NAME_1"].reindex(df.index)
+    df["Kabupaten/Kota"] = result["NAME_2"].reindex(df.index)
+    return df
+
+
+def process_uploaded_xlsx(uploaded_files):
+    """
+    Same pipeline as the CSV version, but for .xlsx uploads:
+      - compiles multiple .xlsx files into one
+      - keeps columns A -> 'Mapping RCA' (+ 'Grid GeoJSON')
+      - extracts Longitude / Latitude and finds Provinsi + Kabupaten/Kota
+      - restores column F (Waktu) with its ORIGINAL value & cell style
+    Returns (excel_bytes, stats_dict). Nothing is written to disk.
+    """
+    shp_path = check_shapefile()
+
+    xlsx_files = sorted(
+        (f for f in uploaded_files if f.name.lower().endswith(".xlsx")),
+        key=lambda f: f.name.lower(),
+    )
+
+    if not xlsx_files:
+        raise ValueError("No .xlsx files uploaded.")
+
+    # =========================
+    # READ EVERY FILE
+    # =========================
+    all_dfs = []
+    waktu_data = []
+    waktu_col_name = None
+
+    for xf in xlsx_files:
+        print(f"Reading: {xf.name}")
+        temp_df, this_waktu_name, waktu_items = read_xlsx_upload(xf)
+
+        if waktu_col_name is None:
+            waktu_col_name = this_waktu_name
+
+        all_dfs.append(temp_df)
+        waktu_data.extend(waktu_items)
+
+    # =========================
+    # MERGE FILES (WITHOUT COLUMN F)
+    # =========================
+    df = pd.concat(all_dfs, ignore_index=True)
+    df.columns = df.columns.astype(str).str.strip()
+
+    # =========================
+    # ENSURE REQUIRED COLUMNS
+    # =========================
+    if "Grid GeoJSON" not in df.columns:
+        raise InvalidExcelError("Column 'Grid GeoJSON' not found.")
+
+    if "Mapping RCA" not in df.columns:
+        print("'Mapping RCA' not found. Creating column...")
+        df["Mapping RCA"] = ""
+
+    # =========================
+    # KEEP ONLY COLUMNS FROM A UNTIL MAPPING RCA
+    # =========================
+    mapping_idx = df.columns.get_loc("Mapping RCA")
+    keep_cols = list(df.columns[:mapping_idx + 1])
+
+    if "Grid GeoJSON" not in keep_cols:
+        keep_cols.append("Grid GeoJSON")
+
+    df = df[keep_cols].copy()
+
+    # =========================
+    # EXTRACT LONGITUDE & LATITUDE
+    # =========================
+    df["Longitude"] = df["Grid GeoJSON"].astype(str).str.extract(
+        r"\[\[\[\[\s*([-\d\.]+)"
+    )
+    df["Latitude"] = df["Grid GeoJSON"].astype(str).str.extract(
+        r"\[\[\[\[\s*[-\d\.]+\s*,\s*([-\d\.]+)"
+    )
+
+    df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
+    df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
+
+    # =========================
+    # PROVINSI & KABUPATEN/KOTA
+    # =========================
+    df = add_provinsi_kabupaten(df, shp_path)
+
+    mapping_idx = df.columns.get_loc("Mapping RCA")
+    provinsi = df.pop("Provinsi")
+    kabupaten = df.pop("Kabupaten/Kota")
+    df.insert(mapping_idx + 1, "Provinsi", provinsi)
+    df.insert(mapping_idx + 2, "Kabupaten/Kota", kabupaten)
+
+    # =========================
+    # RE-INSERT WAKTU AS BLANK PLACEHOLDER
+    # =========================
+    row_count_warning = None
+
+    if len(waktu_data) != len(df):
+        row_count_warning = (
+            "WARNING: number of column F values "
+            f"({len(waktu_data)}) does not match number of "
+            f"output rows ({len(df)}). Check the source files."
+        )
+        print(row_count_warning)
+
+    insert_pos = min(WAKTU_COL - 1, len(df.columns))
+    df.insert(insert_pos, waktu_col_name, "")
+
+    # =========================
+    # SAVE TO MEMORY, THEN REOPEN WITH OPENPYXL
+    # =========================
+    temp_buffer = io.BytesIO()
+    df.to_excel(temp_buffer, index=False)
+    temp_buffer.seek(0)
+
+    wb_output = load_workbook(temp_buffer)
+    ws_output = wb_output.active
+
+    # CLEAR COLUMN F
+    for row in range(2, ws_output.max_row + 1):
+        ws_output.cell(row=row, column=WAKTU_COL).value = None
+
+    # =========================
+    # RESTORE COLUMN F (original value + style)
+    # =========================
+    converted_count = 0
+    kept_count = 0
+
+    for row, item in enumerate(waktu_data, start=2):
+
+        if row > ws_output.max_row:
+            break
+
+        value = item["value"]
+        tgt = ws_output.cell(row=row, column=WAKTU_COL)
+
+        # If the source holds text, try to turn it into a real datetime
+        if isinstance(value, str):
+            value = parse_waktu_value(value)
+
+        tgt.value = value
+
+        # Restore original cell styling
+        if "font" in item:
+            tgt.font = copy(item["font"])
+            tgt.fill = copy(item["fill"])
+            tgt.border = copy(item["border"])
+            tgt.alignment = copy(item["alignment"])
+            tgt.protection = copy(item["protection"])
+
+        if isinstance(value, datetime):
+            original_fmt = item.get("number_format", "General")
+            # keep the original format, unless it's the useless "General"/text
+            if original_fmt in ("General", "@"):
+                tgt.number_format = OUTPUT_NUMBER_FORMAT
+            else:
+                tgt.number_format = original_fmt
+            converted_count += 1
+        else:
+            tgt.number_format = item.get("number_format", "General")
+            kept_count += 1
+
+    # =========================
+    # SAVE FINAL FILE (in memory)
+    # =========================
+    final_buffer = io.BytesIO()
+    wb_output.save(final_buffer)
+    final_buffer.seek(0)
+
+    print("Completed (xlsx)!")
+    print(f"Rows processed : {len(df)}")
+    print(f"XLSX files processed : {len(xlsx_files)}")
+
+    stats = {
+        "rows": len(df),
+        "files": len(xlsx_files),
+        "converted": converted_count,
+        "kept": kept_count,
+        "no_location": int(df["Provinsi"].isna().sum()),
+        "warning": row_count_warning,
+    }
+
+    return final_buffer.getvalue(), stats
+
+
 # =========================
 # STREAMLIT UI
 # =========================
 st.title("Ticket Indihome - Compile Tickets and Define Locations")
 
-uploaded_files = st.file_uploader(
-    "Upload CSV files",
-    type=["csv"],
-    accept_multiple_files=True,
-)
+tab_csv, tab_xlsx = st.tabs(["📄 CSV files", "📊 Excel files (.xlsx)"])
 
-process_clicked = st.button("Process", type="primary")
+# ---------------------------------------------------------
+# TAB 1: CSV (existing behaviour, unchanged)
+# ---------------------------------------------------------
+with tab_csv:
 
-if process_clicked:
-    # Reset any previous result
-    st.session_state.pop("excel_bytes", None)
-    st.session_state.pop("excel_name", None)
-    st.session_state.pop("stats", None)
-
-    if not uploaded_files:
-        st.error("No file uploaded. Please upload at least one CSV file.")
-    else:
-        try:
-            with st.spinner("Processing files..."):
-                excel_bytes, stats = process_uploaded_files(uploaded_files)
-
-            st.session_state["excel_bytes"] = excel_bytes
-            st.session_state["excel_name"] = build_output_filename()
-            st.session_state["stats"] = stats
-
-        except MissingShapefileError as e:
-            st.error("Missing shapefile")
-            st.code(str(e))
-        except InvalidCSVError as e:
-            st.error(f"Invalid CSV: {e}")
-        except ValueError as e:
-            st.error(f"Invalid input: {e}")
-        except Exception as e:
-            st.error(f"An unexpected error occurred while processing: {e}")
-            st.exception(e)
-
-# Show result + download button if processing succeeded
-if "excel_bytes" in st.session_state:
-    stats = st.session_state["stats"]
-
-    st.success("Processing completed successfully!")
-
-    if stats.get("warning"):
-        st.warning(stats["warning"])
-
-    st.write(f"Rows processed : {stats['rows']}")
-    st.write(f"CSV files processed : {stats['files']}")
-    st.write(f"Converted to datetime : {stats['converted']}")
-    st.write(f"Left as text (unparsed) : {stats['fallback']}")
-
-    st.download_button(
-        label="Download Excel",
-        data=st.session_state["excel_bytes"],
-        file_name=st.session_state["excel_name"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    uploaded_files = st.file_uploader(
+        "Upload CSV files",
+        type=["csv"],
+        accept_multiple_files=True,
     )
+
+    process_clicked = st.button("Process", type="primary")
+
+    if process_clicked:
+        # Reset any previous result
+        st.session_state.pop("excel_bytes", None)
+        st.session_state.pop("excel_name", None)
+        st.session_state.pop("stats", None)
+
+        if not uploaded_files:
+            st.error("No file uploaded. Please upload at least one CSV file.")
+        else:
+            try:
+                with st.spinner("Processing files..."):
+                    excel_bytes, stats = process_uploaded_files(uploaded_files)
+
+                st.session_state["excel_bytes"] = excel_bytes
+                st.session_state["excel_name"] = build_output_filename()
+                st.session_state["stats"] = stats
+
+            except MissingShapefileError as e:
+                st.error("Missing shapefile")
+                st.code(str(e))
+            except InvalidCSVError as e:
+                st.error(f"Invalid CSV: {e}")
+            except ValueError as e:
+                st.error(f"Invalid input: {e}")
+            except Exception as e:
+                st.error(f"An unexpected error occurred while processing: {e}")
+                st.exception(e)
+
+    # Show result + download button if processing succeeded
+    if "excel_bytes" in st.session_state:
+        stats = st.session_state["stats"]
+
+        st.success("Processing completed successfully!")
+
+        if stats.get("warning"):
+            st.warning(stats["warning"])
+
+        st.write(f"Rows processed : {stats['rows']}")
+        st.write(f"CSV files processed : {stats['files']}")
+        st.write(f"Converted to datetime : {stats['converted']}")
+        st.write(f"Left as text (unparsed) : {stats['fallback']}")
+
+        st.download_button(
+            label="Download Excel",
+            data=st.session_state["excel_bytes"],
+            file_name=st.session_state["excel_name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_from_csv",
+        )
+
+# ---------------------------------------------------------
+# TAB 2: XLSX (new)
+# ---------------------------------------------------------
+with tab_xlsx:
+
+    st.caption(
+        "Upload one or more .xlsx ticket files. They will be compiled, "
+        "Provinsi and Kabupaten/Kota will be added, and column F (Waktu) "
+        "keeps its original value and formatting."
+    )
+
+    uploaded_xlsx = st.file_uploader(
+        "Upload Excel files",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="xlsx_uploader",
+    )
+
+    process_xlsx_clicked = st.button("Process Excel", type="primary", key="process_xlsx_btn")
+
+    if process_xlsx_clicked:
+        # Reset any previous XLSX result (CSV result is untouched)
+        st.session_state.pop("xlsx_excel_bytes", None)
+        st.session_state.pop("xlsx_excel_name", None)
+        st.session_state.pop("xlsx_stats", None)
+
+        if not uploaded_xlsx:
+            st.error("No file uploaded. Please upload at least one .xlsx file.")
+        else:
+            try:
+                with st.spinner("Processing Excel files..."):
+                    xlsx_bytes, xlsx_stats = process_uploaded_xlsx(uploaded_xlsx)
+
+                st.session_state["xlsx_excel_bytes"] = xlsx_bytes
+                st.session_state["xlsx_excel_name"] = build_output_filename()
+                st.session_state["xlsx_stats"] = xlsx_stats
+
+            except MissingShapefileError as e:
+                st.error("Missing shapefile")
+                st.code(str(e))
+            except InvalidExcelError as e:
+                st.error(f"Invalid Excel file: {e}")
+            except ValueError as e:
+                st.error(f"Invalid input: {e}")
+            except Exception as e:
+                st.error(f"An unexpected error occurred while processing: {e}")
+                st.exception(e)
+
+    if "xlsx_excel_bytes" in st.session_state:
+        xs = st.session_state["xlsx_stats"]
+
+        st.success("Processing completed successfully!")
+
+        if xs.get("warning"):
+            st.warning(xs["warning"])
+
+        st.write(f"Rows processed : {xs['rows']}")
+        st.write(f"Excel files processed : {xs['files']}")
+        st.write(f"Waktu as datetime : {xs['converted']}")
+        st.write(f"Waktu kept as original (non-date) : {xs['kept']}")
+        st.write(f"Rows without location : {xs['no_location']}")
+
+        st.download_button(
+            label="Download Excel",
+            data=st.session_state["xlsx_excel_bytes"],
+            file_name=st.session_state["xlsx_excel_name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_from_xlsx",
+        )
