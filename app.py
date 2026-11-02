@@ -345,14 +345,14 @@ def process_uploaded_files(uploaded_files):
     if "Grid GeoJSON" not in df.columns:
         raise InvalidCSVError("Column 'Grid GeoJSON' not found.")
 
-    if "Mapping RCA" not in df.columns:
-        print("'Mapping RCA' not found. Creating column...")
-        df["Mapping RCA"] = ""
+    if "RCA" not in df.columns:
+        print("'RCA' not found. Creating column...")
+        df["RCA"] = ""
 
     # =========================
-    # KEEP ONLY COLUMNS FROM A UNTIL MAPPING RCA
+    # KEEP ONLY COLUMNS FROM A UNTIL RCA
     # =========================
-    mapping_idx = df.columns.get_loc("Mapping RCA")
+    mapping_idx = df.columns.get_loc("RCA")
     keep_cols = list(df.columns[:mapping_idx + 1])
 
     if "Grid GeoJSON" not in keep_cols:
@@ -420,9 +420,9 @@ def process_uploaded_files(uploaded_files):
     df["Kabupaten/Kota"] = result["NAME_2"]
 
     # =========================
-    # INSERT AFTER MAPPING RCA
+    # INSERT AFTER RCA
     # =========================
-    mapping_idx = df.columns.get_loc("Mapping RCA")
+    mapping_idx = df.columns.get_loc("RCA")
 
     provinsi = df.pop("Provinsi")
     kabupaten = df.pop("Kabupaten/Kota")
@@ -633,7 +633,7 @@ def process_uploaded_xlsx(uploaded_files):
     """
     Same pipeline as the CSV version, but for .xlsx uploads:
       - compiles multiple .xlsx files into one
-      - keeps columns A -> 'Mapping RCA' (+ 'Grid GeoJSON')
+      - keeps columns A -> 'RCA' (+ 'Grid GeoJSON')
       - extracts Longitude / Latitude and finds Provinsi + Kabupaten/Kota
       - restores column F (Waktu) with its ORIGINAL value & cell style
     Returns (excel_bytes, stats_dict). Nothing is written to disk.
@@ -677,14 +677,14 @@ def process_uploaded_xlsx(uploaded_files):
     if "Grid GeoJSON" not in df.columns:
         raise InvalidExcelError("Column 'Grid GeoJSON' not found.")
 
-    if "Mapping RCA" not in df.columns:
-        print("'Mapping RCA' not found. Creating column...")
-        df["Mapping RCA"] = ""
+    if "RCA" not in df.columns:
+        print("'RCA' not found. Creating column...")
+        df["RCA"] = ""
 
     # =========================
-    # KEEP ONLY COLUMNS FROM A UNTIL MAPPING RCA
+    # KEEP ONLY COLUMNS FROM A UNTIL RCA
     # =========================
-    mapping_idx = df.columns.get_loc("Mapping RCA")
+    mapping_idx = df.columns.get_loc("RCA")
     keep_cols = list(df.columns[:mapping_idx + 1])
 
     if "Grid GeoJSON" not in keep_cols:
@@ -710,7 +710,7 @@ def process_uploaded_xlsx(uploaded_files):
     # =========================
     df = add_provinsi_kabupaten(df, shp_path)
 
-    mapping_idx = df.columns.get_loc("Mapping RCA")
+    mapping_idx = df.columns.get_loc("RCA")
     provinsi = df.pop("Provinsi")
     kabupaten = df.pop("Kabupaten/Kota")
     df.insert(mapping_idx + 1, "Provinsi", provinsi)
